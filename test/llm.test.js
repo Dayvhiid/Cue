@@ -161,18 +161,35 @@ function cerebrasSettings(overrides) {
     provider: 'cerebras',
     smart: true,
     apiKeys: { cerebras: 'csk-test' },
-    models: { cerebras: { fast: 'qwen-3.8-27b', smart: 'qwen-3.8-27b' } }
+    models: { cerebras: { fast: 'gpt-oss-120b', smart: 'gpt-oss-120b' } }
   }, overrides || {});
 }
 
 test('selects the Cerebras model for the active tier and reports readiness', () => {
   const smart = createLLM(cerebrasSettings({ smart: true }));
   assert.equal(smart.provider, 'cerebras');
-  assert.equal(smart.model, 'qwen-3.8-27b');
+  assert.equal(smart.model, 'gpt-oss-120b');
   assert.equal(smart.ready, true);
 
   const fast = createLLM(cerebrasSettings({ smart: false }));
-  assert.equal(fast.model, 'qwen-3.8-27b');
+  assert.equal(fast.model, 'gpt-oss-120b');
+});
+
+test('a saved qwen-3.8-27b (the old default) migrates to gpt-oss-120b', () => {
+  const llm = createLLM(cerebrasSettings({ models: { cerebras: { fast: 'qwen-3.8-27b', smart: 'qwen-3.8-27b' } } }));
+  assert.equal(llm.model, 'gpt-oss-120b');
+});
+
+test('Cerebras gpt-oss gets a low reasoning effort on Fast, medium on Smart', async () => {
+  await createLLM(cerebrasSettings({ smart: false })).stream({ system: 's', turns: [{ role: 'user', text: 'hi' }], onToken: () => {} });
+  assert.equal(capturedCompletionRequest.reasoning_effort, 'low');
+  await createLLM(cerebrasSettings({ smart: true })).stream({ system: 's', turns: [{ role: 'user', text: 'hi' }], onToken: () => {} });
+  assert.equal(capturedCompletionRequest.reasoning_effort, 'medium');
+});
+
+test('non-Cerebras OpenAI-compatible requests carry no reasoning_effort', async () => {
+  await createLLM(createCustomSettings()).stream({ system: 's', turns: [{ role: 'user', text: 'hi' }], onToken: () => {} });
+  assert.equal('reasoning_effort' in capturedCompletionRequest, false);
 });
 
 test('routes Cerebras to https://api.cerebras.ai/v1', async () => {

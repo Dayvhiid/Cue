@@ -89,7 +89,7 @@ const DEFAULTS = {
   windowX: null,
   windowY: null,
   models: {
-    cerebras: { fast: 'qwen-3.8-27b', smart: 'qwen-3.8-27b' },
+    cerebras: { fast: 'gpt-oss-120b', smart: 'gpt-oss-120b' },
     openai: { fast: 'gpt-4o-mini', smart: 'gpt-4o' },
     // Kept in sync with CURRENT_ANTHROPIC_DEFAULT_FAST/_SMART in src/llm.js —
     // claude-3-5-haiku-latest/claude-3-5-sonnet-latest (the previous defaults
@@ -98,7 +98,7 @@ const DEFAULTS = {
     // not src/llm.js's DEFAULT_MODELS, which only backstops a missing entry) —
     // llm.js's DEAD_ANTHROPIC_MODEL_RE self-heal additionally migrates any
     // settings file already saved with the old dead ids.
-    anthropic: { fast: 'claude-haiku-4-5-20251001', smart: 'claude-sonnet-4-5-20250929' },
+    anthropic: { fast: 'claude-haiku-5-5', smart: 'claude-opus-5-5' },
     // fast is kept in sync with CURRENT_GEMINI_DEFAULT in src/llm.js —
     // gemini-2.0-flash (the original default here) was retired by Google on
     // 2026-03-03 and 404s on every request. smart is the newest Pro release.

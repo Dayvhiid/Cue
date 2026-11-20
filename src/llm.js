@@ -24,12 +24,26 @@ const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.5-transcribe-live';
 // claude-3-5-haiku-latest / claude-3-5-sonnet-latest were retired by Anthropic
 // (confirmed absent from GET https://api.anthropic.com/v1/models as of Sep 19
 // 2026 — every claude-2.x and claude-3.x id 404s with not_found_error).
-// claude-haiku-4-5-20251001 / claude-sonnet-4-5-20250929 are current and were
-// live-verified with a real request before shipping this default.
-const CURRENT_ANTHROPIC_DEFAULT_FAST = 'claude-haiku-4-5-20251001';
-const CURRENT_ANTHROPIC_DEFAULT_SMART = 'claude-sonnet-4-5-20250929';
+// Fast tier: Claude Haiku 5.5 (latency-sensitive overlay answers). Smart tier:
+// Claude Opus 5.5. Bare ids — current Claude models take no date suffix.
+const CURRENT_ANTHROPIC_DEFAULT_FAST = 'claude-haiku-5-5';
+const CURRENT_ANTHROPIC_DEFAULT_SMART = 'claude-opus-5-5';
+// Exact ids earlier releases shipped as the defaults. Store defaults are
+// persisted into settings.json, so an install that never touched the model
+// fields still carries these; treat them as "the default" and upgrade.
+const PREVIOUS_ANTHROPIC_DEFAULTS = {
+  fast: ['claude-haiku-4-5-20251001'],
+  smart: ['claude-sonnet-4-5-20250929']
+};
+// Cerebras's shared tier only offers reasoning models. qwen-3.8-27b (the old
+// default) has no way to cap its thinking and could spend the whole output
+// budget before answering; gpt-oss-120b takes reasoning_effort, so cue keeps
+// its thinking short. The old default is persisted in settings.json, so it is
+// migrated at read time like PREVIOUS_ANTHROPIC_DEFAULTS.
+const CURRENT_CEREBRAS_DEFAULT = 'gpt-oss-120b';
+const PREVIOUS_CEREBRAS_DEFAULTS = ['qwen-3.8-27b'];
 const DEFAULT_MODELS = {
-  cerebras: 'qwen-3.8-27b',
+  cerebras: CURRENT_CEREBRAS_DEFAULT,
   openai: 'gpt-4o-mini',
   anthropic: CURRENT_ANTHROPIC_DEFAULT_FAST,
   gemini: CURRENT_GEMINI_DEFAULT,
@@ -236,7 +250,7 @@ function stripDataUrl(dataUrl) {
   return m ? { mime: m[1], b64: m[2] } : null;
 }
 
-async function streamOpenAI({ apiKey, baseURL, model, system, turns, imageDataUrl, maxTokens, onToken, onResponse }) {
+async function streamOpenAI({ apiKey, baseURL, model, system, turns, imageDataUrl, maxTokens, extraBody, onToken, onResponse, onActivity, onFinish }) {
   const OpenAI = require('openai');
   const client = new OpenAI(baseURL ? { apiKey, baseURL } : { apiKey });
   const messages = [{ role: 'system', content: system }];
@@ -253,7 +267,7 @@ async function streamOpenAI({ apiKey, baseURL, model, system, turns, imageDataUr
       messages.push({ role: t.role, content: t.text });
     }
   });
-  const pending = client.chat.completions.create({ model, messages, stream: true, max_tokens: maxTokens });
+  const pending = client.chat.completions.create({ model, messages, stream: true, max_tokens: maxTokens, ...(extraBody || {}) });
   let stream;
   if (typeof onResponse === 'function' && pending && typeof pending.withResponse === 'function') {
     // The gateway stamps x-publik-* headers at admission; hand the raw
@@ -264,10 +278,24 @@ async function streamOpenAI({ apiKey, baseURL, model, system, turns, imageDataUr
   } else {
     stream = await pending;
   }
+  return consumeOpenAIStream(stream, { onToken, onActivity, onFinish });
+}
+
+// Shared by every OpenAI-compatible stream. Reasoning models (DeepSeek's
+// v4-pro, o-series/gpt-5 behind Custom, many gateway models) stream their
+// chain of thought in delta.reasoning_content / delta.reasoning and no
+// `content` for a long stretch: that is still liveness for the caller's
+// inactivity watchdog, never visible text. finish_reason is reported so a
+// cap-truncated answer is not passed off as a complete one.
+async function consumeOpenAIStream(stream, { onToken, onActivity, onFinish }) {
   let full = '';
   for await (const part of stream) {
-    const d = part.choices && part.choices[0] && part.choices[0].delta && part.choices[0].delta.content;
+    if (onActivity) onActivity();
+    const choice = part && part.choices && part.choices[0];
+    if (!choice) continue;
+    const d = choice.delta && choice.delta.content;
     if (d) { full += d; onToken(d); }
+    if (choice.finish_reason && onFinish) onFinish(choice.finish_reason);
   }
   return full;
 }
@@ -283,7 +311,7 @@ function normalizeAzureBaseURL(raw) {
   return u;
 }
 
-async function streamAzure({ apiKey, model, system, turns, imageDataUrl, maxTokens, onToken, endpoint }) {
+async function streamAzure({ apiKey, model, system, turns, imageDataUrl, maxTokens, onToken, onActivity, onFinish, endpoint }) {
   const url = normalizeAzureBaseURL(endpoint);
   if (!url) throw new Error('Missing Azure endpoint. Add your Azure AI Foundry or Azure OpenAI endpoint in Settings.');
   const messages = [{ role: 'system', content: system }];
@@ -314,17 +342,49 @@ async function streamAzure({ apiKey, model, system, turns, imageDataUrl, maxToke
     client = new OpenAI({ baseURL: url, apiKey, fetch: azureFetch });
   }
   const stream = await client.chat.completions.create({ model, messages, stream: true, max_completion_tokens: maxTokens });
-  let full = '';
-  for await (const part of stream) {
-    const d = part.choices && part.choices[0] && part.choices[0].delta && part.choices[0].delta.content;
-    if (d) { full += d; onToken(d); }
-  }
-  return full;
+  return consumeOpenAIStream(stream, { onToken, onActivity, onFinish });
 }
 
-async function streamAnthropic({ apiKey, model, system, turns, imageDataUrl, maxTokens, onToken }) {
+// Current Claude families think by default (adaptive thinking), and thinking
+// tokens count toward max_tokens: a 700-token cap sized for a short visible
+// answer can be eaten by thinking, ending with stop_reason "max_tokens" and no
+// text. These models get headroom plus an explicit effort level (the lever
+// Anthropic recommends over disabling thinking; Opus 5.5 rejects "disabled").
+// Older ids (4.x) get the request unchanged — they reject `effort`.
+const ANTHROPIC_ADAPTIVE_MODEL_RE = /^claude-(haiku-5-5|sonnet-5|sonnet-5-5|opus-5|opus-5-5|fable-5|fable-5-1)$/;
+// Models that accept server-side refusal fallbacks in the "default" form.
+const ANTHROPIC_FALLBACK_MODEL_RE = /^claude-(opus-5|opus-5-5|sonnet-5-5|fable-5-1)$/;
+const ANTHROPIC_FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+const ANTHROPIC_THINKING_HEADROOM = { fast: 2048, smart: 8192 };
+
+/**
+ * Model-specific request fields for one Anthropic call. Pure, so the shape is
+ * unit-testable without the SDK. `thinking` is cue's Smart toggle.
+ */
+function anthropicRequestOptions({ model, maxTokens, thinking }) {
+  if (!ANTHROPIC_ADAPTIVE_MODEL_RE.test(model || '')) return { maxTokens, body: {}, headers: null };
+  const tier = thinking ? 'smart' : 'fast';
+  const body = {
+    // "summarized" rather than the default "omitted": with omitted, nothing at
+    // all is streamed while the model thinks, and a long think trips the
+    // caller's inactivity watchdog. The summaries are never shown.
+    thinking: { type: 'adaptive', display: 'summarized' },
+    output_config: { effort: thinking ? 'medium' : 'low' }
+  };
+  let headers = null;
+  if (ANTHROPIC_FALLBACK_MODEL_RE.test(model)) {
+    // On a safety-classifier decline the API re-runs the request on a
+    // fallback model inside the same stream instead of returning nothing.
+    body.fallbacks = 'default';
+    headers = { 'anthropic-beta': ANTHROPIC_FALLBACK_BETA };
+  }
+  return { maxTokens: maxTokens + ANTHROPIC_THINKING_HEADROOM[tier], body, headers };
+}
+
+async function streamAnthropic({ apiKey, model, system, turns, imageDataUrl, maxTokens, thinking, onToken, onActivity, onFinish }) {
   const Anthropic = require('@anthropic-ai/sdk');
   const client = new Anthropic({ apiKey });
+  const shaped = anthropicRequestOptions({ model, maxTokens, thinking });
   const messages = turns.map((t, i) => {
     const last = i === turns.length - 1;
     if (last && imageDataUrl && t.role === 'user') {
@@ -336,11 +396,24 @@ async function streamAnthropic({ apiKey, model, system, turns, imageDataUrl, max
     }
     return { role: t.role, content: t.text };
   });
-  const stream = await client.messages.create({ model, max_tokens: maxTokens, system, messages, stream: true });
+  const stream = await client.messages.create(
+    { model, max_tokens: shaped.maxTokens, system, messages, stream: true, ...shaped.body },
+    shaped.headers ? { headers: shaped.headers } : undefined
+  );
   let full = '';
+  let stopReason = null;
   for await (const ev of stream) {
+    // Thinking streams no visible text (its display is "omitted" by default),
+    // so report every event as liveness — otherwise the caller's inactivity
+    // watchdog can fire while the model is still working.
+    if (onActivity) onActivity();
     if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') { full += ev.delta.text; onToken(ev.delta.text); }
+    if (ev.type === 'message_delta' && ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
   }
+  // A refusal is an HTTP 200, not an exception; any partial text is not a
+  // complete answer and must not be presented as one.
+  if (stopReason === 'refusal') throw new Error('Claude declined to answer this request. Try rephrasing it.');
+  if (stopReason && onFinish) onFinish(stopReason);
   return full;
 }
 
@@ -363,7 +436,7 @@ function geminiGenerationConfig({ system, maxTokens, thinking }) {
   return config;
 }
 
-async function streamGemini({ apiKey, model, system, turns, imageDataUrl, maxTokens, thinking, onToken }) {
+async function streamGemini({ apiKey, model, system, turns, imageDataUrl, maxTokens, thinking, onToken, onActivity, onFinish }) {
   const { GoogleGenAI } = require('@google/genai');
   const ai = new GoogleGenAI({ apiKey });
   const contents = turns.map((t, i) => {
@@ -388,13 +461,16 @@ async function streamGemini({ apiKey, model, system, turns, imageDataUrl, maxTok
   }
   let full = '';
   for await (const chunk of stream) {
+    if (onActivity) onActivity(); // thought-only chunks carry no text but are liveness
     const t = chunk && chunk.text;
     if (t) { full += t; onToken(t); }
+    const reason = chunk && chunk.candidates && chunk.candidates[0] && chunk.candidates[0].finishReason;
+    if (reason && onFinish) onFinish(reason);
   }
   return full;
 }
 
-async function streamOllama({ apiKey, model, system, turns, imageDataUrl, maxTokens, onToken }) {
+async function streamOllama({ apiKey, model, system, turns, imageDataUrl, maxTokens, onToken, onActivity, onFinish }) {
   const baseUrl = apiKey || 'http://localhost:11434';
   const url = `${baseUrl.replace(/\/$/, '')}/api/chat`;
 
@@ -431,7 +507,9 @@ async function streamOllama({ apiKey, model, system, turns, imageDataUrl, maxTok
   const decoder = new TextDecoder();
   let full = '';
   let buffer = '';
+  const note = (data) => { if (data && data.done && data.done_reason && onFinish) onFinish(data.done_reason); };
   for await (const chunk of response.body) {
+    if (onActivity) onActivity();
     buffer += decoder.decode(chunk, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop(); // keep incomplete line
@@ -443,6 +521,7 @@ async function streamOllama({ apiKey, model, system, turns, imageDataUrl, maxTok
           full += data.message.content;
           onToken(data.message.content);
         }
+        note(data);
       } catch (e) {
         // ignore
       }
@@ -455,6 +534,7 @@ async function streamOllama({ apiKey, model, system, turns, imageDataUrl, maxTok
         full += data.message.content;
         onToken(data.message.content);
       }
+      note(data);
     } catch (e) { }
   }
   return full;
@@ -473,12 +553,13 @@ function createLLM(settings) {
     model = resolveGeminiModel(settings);
   }
   if (provider === PUBLIK_PROVIDER && !model) model = publik.DEFAULT_MODELS[tier];
-  if (provider === 'anthropic' && DEAD_ANTHROPIC_MODEL_RE.test(model || '')) {
+  if (provider === 'anthropic' && (DEAD_ANTHROPIC_MODEL_RE.test(model || '') || PREVIOUS_ANTHROPIC_DEFAULTS[tier].includes(model))) {
     model = tier === 'smart' ? CURRENT_ANTHROPIC_DEFAULT_SMART : CURRENT_ANTHROPIC_DEFAULT_FAST;
   }
   if (provider === 'deepseek' && DEAD_DEEPSEEK_MODEL_RE.test(model || '')) {
     model = /reasoner/i.test(model) ? CURRENT_DEEPSEEK_SMART_DEFAULT : CURRENT_DEEPSEEK_FAST_DEFAULT;
   }
+  if (provider === 'cerebras' && PREVIOUS_CEREBRAS_DEFAULTS.includes(model)) model = CURRENT_CEREBRAS_DEFAULT;
   if (!model) model = DEFAULT_MODELS[provider] || '';
   const minimaxRegion = settings.minimaxRegion || 'global_en';
   const endpoint = settings.azureEndpoint || '';
@@ -516,22 +597,91 @@ function createLLM(settings) {
   }
 
   const ready = !configurationError && !!model;
-  const maxTokens = settings.smart ? 1400 : 700;
+  // The visible-answer cap. Prompts already ask for concise output, so this is
+  // a ceiling, not a target, but at the old 700/1400 a LeetCode answer
+  // (approach + full solution + complexity) routinely hit it mid-code-block.
+  const maxTokens = settings.smart ? ANSWER_TOKEN_CAP.smart : ANSWER_TOKEN_CAP.fast;
+
+  function supportsImages() {
+    return !TEXT_ONLY_PROVIDERS.has(provider) && !TEXT_ONLY_MODELS.has(provider + ':' + model);
+  }
 
   return {
     provider, model, apiKey, baseURL,
     ready,
     configurationError,
+    supportsImages,
     async stream(params) {
       if (!ready) throw new Error(configurationError || `Complete the ${provider} provider settings.`);
-      const args = { apiKey, baseURL, endpoint, model, maxTokens, thinking: !!settings.smart, ...params, turns: sanitizeTurns(params.turns) };
+      let finish = null;
+      const args = {
+        apiKey, baseURL, endpoint, model, maxTokens, thinking: !!settings.smart, ...params,
+        turns: sanitizeTurns(params.turns),
+        onFinish: (reason) => { finish = normalizeFinishReason(reason) || finish; }
+      };
+      // Text-only models (e.g. every Cerebras model) answer a request that
+      // carries a screenshot with a bare "400 status code (no body)". Once a
+      // model is known to be text-only, don't attach the image at all.
+      // With `requireImage` (a "look at my screen" request) the screenshot is
+      // the question: answering without it produces a confident answer to
+      // something else, so throw IMAGE_UNSUPPORTED and let the caller pick a
+      // model that can see, instead of silently dropping the image.
+      const visionKey = provider + ':' + model;
+      if (args.imageDataUrl && !supportsImages()) {
+        if (params.requireImage) throw imageUnsupportedError(provider, model);
+        args.imageDataUrl = null;
+      }
+      let text;
+      try {
+        text = await dispatch(args);
+      } catch (error) {
+        if (!args.imageDataUrl || error.status !== 400) throw error;
+        // The screenshot is the most likely cause; ask once more without it.
+        // If this also fails, the error is unrelated and surfaces as usual.
+        if (params.requireImage) {
+          TEXT_ONLY_MODELS.add(visionKey);
+          throw imageUnsupportedError(provider, model);
+        }
+        text = await dispatch({ ...args, imageDataUrl: null });
+        TEXT_ONLY_MODELS.add(visionKey);
+        if (typeof params.onImageUnsupported === 'function') params.onImageUnsupported(normalizeProviderName(provider), model);
+      }
+      // A reasoning model that spent the whole cap thinking streamed no
+      // visible text (so nothing reached onToken): retry once with room for
+      // the reasoning instead of failing an answer the model was writing.
+      if (!String(text || '').trim() && finish === 'length') {
+        finish = null;
+        text = await dispatch({ ...args, maxTokens: maxTokens + REASONING_RETRY_HEADROOM });
+      }
+      const label = normalizeProviderName(provider);
+      // An empty answer used to resolve as success and leave a blank bubble.
+      if (!String(text || '').trim()) {
+        if (finish === 'length') throw new Error(`${label} ran out of room before writing an answer (model "${model}" spent its output budget reasoning). Try again, or pick a non-reasoning model in Settings.`);
+        if (finish === 'filtered') throw new Error(`${label} blocked this response with its content filter. Try rephrasing the request.`);
+        throw new Error(`${label} returned an empty answer. Please try again.`);
+      }
+      if (finish === 'length' && typeof params.onTruncated === 'function') params.onTruncated();
+      return text;
+    }
+  };
+
+  async function dispatch(args) {
       try {
         if (provider === 'openai') return await streamOpenAI(args);
         if (provider === CUSTOM_PROVIDER) return await streamOpenAI(args);
         if (provider === PUBLIK_PROVIDER) return await streamOpenAI(args);
         if (provider === 'ollama') return await streamOllama(args);
         if (provider === 'groq') return await streamOpenAI({ ...args, baseURL: 'https://api.groq.com/openai/v1' });
-        if (provider === 'cerebras') return await streamOpenAI({ ...args, baseURL: CEREBRAS_BASE_URL });
+        // Every Cerebras shared model reasons before answering, and reasoning
+        // tokens count against max_tokens: give the cap headroom so the
+        // visible budget is still what maxTokens says, and keep gpt-oss's
+        // thinking short on the Fast tier.
+        if (provider === 'cerebras') return await streamOpenAI({
+          ...args,
+          maxTokens: args.maxTokens + CEREBRAS_REASONING_HEADROOM[tier],
+          baseURL: CEREBRAS_BASE_URL,
+          extraBody: /^gpt-oss/i.test(model) ? { reasoning_effort: tier === 'smart' ? 'medium' : 'low' } : undefined
+        });
         if (provider === 'minimax') return await streamOpenAI({ ...args, baseURL: MINIMAX_BASE_URLS[minimaxRegion] || MINIMAX_BASE_URLS.global_en });
         if (provider === 'deepseek') return await streamOpenAI({ ...args, baseURL: DEEPSEEK_BASE_URL });
         if (provider === 'anthropic') return await streamAnthropic(args);
@@ -542,10 +692,39 @@ function createLLM(settings) {
         // publik branches return an Error carrying `.action`; the string
         // branches keep working unchanged.
         const wrapped = formatProviderErrorMessage(error, provider, model);
-        throw wrapped instanceof Error ? wrapped : new Error(wrapped);
+        const out = wrapped instanceof Error ? wrapped : new Error(wrapped);
+        // Keep the HTTP status so stream() can tell a rejected request apart.
+        const status = error && (error.status || error.statusCode);
+        if (status && out.status === undefined) out.status = status;
+        throw out;
       }
-    }
-  };
+  }
+}
+
+// provider:model pairs that rejected an attached screenshot this session.
+const TEXT_ONLY_MODELS = new Set();
+// Providers with no image input on any model (Cerebras: verified live with
+// gpt-oss-120b and qwen-3.8-27b, both 400 on an image part).
+const TEXT_ONLY_PROVIDERS = new Set(['cerebras']);
+
+function imageUnsupportedError(provider, model) {
+  const e = new Error(`${normalizeProviderName(provider)} model "${model}" can't read screenshots.`);
+  e.code = 'IMAGE_UNSUPPORTED';
+  return e;
+}
+
+const ANSWER_TOKEN_CAP = { fast: 2000, smart: 4000 };
+const CEREBRAS_REASONING_HEADROOM = { fast: 4096, smart: 8192 };
+// Extra room for the one retry after a reasoning-only, cap-truncated stream.
+const REASONING_RETRY_HEADROOM = 12000;
+
+// Each provider names "stopped at the cap" / "blocked" differently.
+function normalizeFinishReason(reason) {
+  const r = String(reason || '').toLowerCase();
+  if (!r) return null;
+  if (r === 'length' || r === 'max_tokens') return 'length';
+  if (['content_filter', 'safety', 'prohibited_content', 'blocklist', 'spii', 'recitation'].includes(r)) return 'filtered';
+  return 'stop';
 }
 
 module.exports = {
@@ -560,6 +739,12 @@ module.exports = {
   GEMINI_TRANSCRIBE_LIVE_MODEL,
   CURRENT_ANTHROPIC_DEFAULT_FAST,
   CURRENT_ANTHROPIC_DEFAULT_SMART,
+  PREVIOUS_ANTHROPIC_DEFAULTS,
+  anthropicRequestOptions,
+  normalizeFinishReason,
+  ANSWER_TOKEN_CAP,
+  CEREBRAS_REASONING_HEADROOM,
+  REASONING_RETRY_HEADROOM,
   PUBLIK_PROVIDER,
   isRateLimitError
 };

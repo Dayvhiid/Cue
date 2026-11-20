@@ -122,13 +122,29 @@
   }
 
   let busyFailsafe = null;
-  function setBusy(v) {
-    busy = v;
-    $('#send-btn').classList.toggle('busy', v);
+  // True from the moment a click sends `ask` until main answers it with
+  // llm:start (accepted) or llm:busy (rejected). Lets llm:busy tell apart
+  // "my request was refused" from a refusal of some other caller's request
+  // (e.g. a global shortcut pressed mid-answer).
+  let askPending = false;
+  const BUSY_FAILSAFE_MS = 40000;
+  function armBusyFailsafe() {
     clearTimeout(busyFailsafe);
     // Failsafe: main has a 25s stream watchdog that always sends llm:done/llm:error, but if a
     // terminal event is ever lost the whole UI stays frozen — self-clear after a generous window.
-    if (v) busyFailsafe = setTimeout(() => { busy = false; $('#send-btn').classList.toggle('busy', false); }, 40000);
+    // Measured from the last sign of life (re-armed on every streamed chunk), so a long answer that is still
+    // streaming never has its lock pulled out from under it.
+    busyFailsafe = setTimeout(() => {
+      busy = false; askPending = false;
+      $('#send-btn').classList.toggle('busy', false);
+    }, BUSY_FAILSAFE_MS);
+  }
+  function setBusy(v) {
+    busy = v;
+    if (!v) askPending = false;
+    $('#send-btn').classList.toggle('busy', v);
+    clearTimeout(busyFailsafe);
+    if (v) armBusyFailsafe();
   }
 
   // ---- transcript helpers ------------------------------------------------
@@ -170,8 +186,13 @@
 
   // ---- actions -----------------------------------------------------------
   function runMode(mode, text) {
-    if (busy) return;
+    if (busy) {
+      // Previously a silent no-op, which read as "the button is broken".
+      showToast('Still working on the last answer…', 1800);
+      return;
+    }
     setBusy(true);
+    askPending = true;
     cue.ask({ mode, text: text || '' });
   }
 
@@ -1193,13 +1214,52 @@
         messages.scrollTo({ top: sep.offsetTop - messages.offsetTop, behavior: 'smooth' });
       }
     });
+    askPending = false;
     setBusy(true);
   });
-  cue.on('llm:token', ({ text }) => appendToken(text));
-  cue.on('llm:done', () => { finalizeAi(); setBusy(false); });
+  // Main refused the request (it is still finishing an earlier one). Release the
+  // lock this click took, or the buttons stay dead until the 40s failsafe.
+  cue.on('llm:busy', ({ reason } = {}) => {
+    if (!askPending) return;
+    setBusy(false);
+    if (reason !== 'unknown-mode') showToast('Still working on the last answer — try again in a moment', 2200);
+  });
+  cue.on('llm:token', ({ text }) => { if (busy) armBusyFailsafe(); appendToken(text); });
+  // A small line under the current answer (cut off / failed partway). Goes in
+  // the answer's own response group so it scrolls and expires with it.
+  function appendAiNote(text, kind) {
+    const note = document.createElement('div');
+    note.className = 'ai-note' + (kind ? ' ' + kind : '');
+    note.textContent = text;
+    const host = (aiEl && aiEl.parentNode) || messages.lastElementChild || messages;
+    host.appendChild(note);
+  }
+  let answerTruncated = false;
+  cue.on('llm:start', () => { answerTruncated = false; });
+  cue.on('llm:truncated', () => { answerTruncated = true; });
+  // Main is still receiving stream events (e.g. the model is thinking) — not stuck.
+  cue.on('llm:alive', () => { if (busy) armBusyFailsafe(); });
+  cue.on('llm:done', () => {
+    const host = aiEl && aiEl.parentNode;
+    finalizeAi(); setBusy(false);
+    if (answerTruncated) {
+      answerTruncated = false;
+      const note = document.createElement('div');
+      note.className = 'ai-note';
+      note.textContent = 'Answer cut off at the length limit. Ask again for the rest' + (settings && settings.smart ? '.' : ', or turn on Smart for longer answers.');
+      (host || messages.lastElementChild || messages).appendChild(note);
+    }
+  });
   cue.on('llm:error', ({ message, action }) => {
-    if (!aiEl) startAi(true);
-    aiEl.dataset.raw = message; finalizeAi(); setBusy(false);
+    if (aiEl && (aiEl.dataset.raw || '').trim()) {
+      // Part of the answer already streamed: keep it on screen and say what
+      // went wrong underneath, instead of overwriting it with the error.
+      appendAiNote(message, 'error');
+      finalizeAi(); setBusy(false);
+    } else {
+      if (!aiEl) startAi(true);
+      aiEl.dataset.raw = message; finalizeAi(); setBusy(false);
+    }
     // publik errors carry one action: the renderer's markdown emits no anchors,
     // so a link needs a real button (same pattern as the mic banner).
     if (action && action.kind === 'card') { showPublikCard(); return; }

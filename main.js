@@ -6,6 +6,16 @@ const { captureScreenshot } = require('./src/screen');
 const { createSTT } = require('./src/stt');
 const { parseDocumentFile } = require('./src/resume');
 const { createLLM } = require('./src/llm');
+const ocr = require('./src/ocr');
+
+// Text-only models (every Cerebras model) can't take a screenshot, and one
+// answered without it answers some other question. Read the screen's text
+// locally instead and hand that to the same model. Throws a user-facing
+// message when that isn't possible.
+async function readScreenText(imageBuffer) {
+  if (!ocr.isAvailable()) throw new Error("Your model can't read images, and reading screen text locally is only supported on Windows. Pick a vision-capable model in Settings to use screen features.");
+  return ocr.recognizeText(imageBuffer);
+}
 const { MODES } = require('./src/prompts');
 const { rms16 } = require('./src/wav');
 const { createStreamingSTT } = require('./src/stt-streaming');
@@ -534,6 +544,22 @@ async function captionSlide(imageDataUrl, transcriptSlice) {
   const settings = store.getSettings();
   const llm = createLLM(settings);
   if (!llm.ready) throw new Error(llm.configurationError || 'Complete the provider settings.');
+  let system = buildSlideSystem();
+  let userText = buildSlideUser(transcriptSlice);
+  // A caption written without the image is invented: give a text-only model
+  // the slide's text instead.
+  if (!llm.supportsImages()) {
+    const b64 = String(imageDataUrl).replace(/^data:[^,]*,/, '');
+    let screenText;
+    try {
+      screenText = await readScreenText(Buffer.from(b64, 'base64'));
+    } catch (e) {
+      throw Object.assign(new Error(e.message), { code: 'IMAGE_UNSUPPORTED' });
+    }
+    if (!screenText) return '';
+    ({ system, userText } = ocr.withScreenText(system, userText, screenText));
+    imageDataUrl = null;
+  }
   let watchdog = null;
   const stalled = new Promise((_res, reject) => {
     watchdog = setTimeout(() => reject(new Error('slide caption timed out')), STREAM_INACTIVITY_MS);
@@ -541,9 +567,10 @@ async function captionSlide(imageDataUrl, transcriptSlice) {
   try {
     return await Promise.race([
       llm.stream({
-        system: buildSlideSystem(),
-        turns: [{ role: 'user', text: buildSlideUser(transcriptSlice) }],
+        system,
+        turns: [{ role: 'user', text: userText }],
         imageDataUrl,
+        requireImage: !!imageDataUrl,
         maxTokens: 300,
         onToken: () => {}
       }),
@@ -596,7 +623,7 @@ async function pollSlides() {
     recordEvent({ level: 'info', event: 'slide_captured', msg: 'slide ' + slideStore.count() + ' captioned' });
   } catch (e) {
     const msg = (e && e.message) || String(e);
-    if (/429|quota|401|403|model_not_found/i.test(msg)) {
+    if ((e && e.code === 'IMAGE_UNSUPPORTED') || /429|quota|401|403|model_not_found/i.test(msg)) {
       slideDisabled = true;
       send('status', { message: 'Slide captions paused: ' + msg });
     } else {
@@ -761,9 +788,11 @@ async function setCapturing(active) {
 
 // -------- feature runner --------
 async function runFeature(mode, userText) {
-  if (state.busy) return;
+  // Never drop a request silently: the renderer has already marked itself busy
+  // for this click and would otherwise sit unresponsive with no explanation.
+  if (state.busy) { send('llm:busy', { mode }); return; }
   const def = MODES[mode];
-  if (!def) return;
+  if (!def) { send('llm:busy', { mode, reason: 'unknown-mode' }); return; }
   state.busy = true;
   let streamSettled = false; // drop stray tokens from a stream we've already abandoned
   try {
@@ -801,10 +830,16 @@ async function runFeature(mode, userText) {
     }
 
     let imageDataUrl = null;
+    let screenPng = null; // full-res capture for local OCR when the model is text-only
     if (def.needsScreen) {
       try {
-        imageDataUrl = await captureScreenshot();
-        if (!imageDataUrl) throw new Error('No screen source was available.');
+        if (llm.supportsImages()) {
+          imageDataUrl = await captureScreenshot();
+          if (!imageDataUrl) throw new Error('No screen source was available.');
+        } else {
+          screenPng = await captureScreenshot({ fullResPng: true });
+          if (!screenPng) throw new Error('No screen source was available.');
+        }
       }
       catch (e) {
         recordEvent({ level: 'error', event: 'screen_capture_failed', msg: e && e.message ? e.message : String(e), frame: 'captureScreenshot', context: { mode } });
@@ -835,13 +870,22 @@ async function runFeature(mode, userText) {
     // has something to draw on. Never the current meeting, never leetcode.
     const memoryBlock = mode !== 'leetcode' && meetingMemory ? meetingMemory.memoryBlock() : null;
     if (memoryBlock) contextBlock = contextBlock ? contextBlock + '\n\n' + memoryBlock : memoryBlock;
-    const system = def.buildSystem ? def.buildSystem(contextBlock, settingsForPrompt.aiRules || '') : (def.system || '');
-    const built = def.build({ transcript, userText: userText || '' });
+    let system = def.buildSystem ? def.buildSystem(contextBlock, settingsForPrompt.aiRules || '') : (def.system || '');
+    let built = def.build({ transcript, userText: userText || '' });
+
+    // Text-only model: the screen goes in as locally-read text, same model.
+    const addScreenText = async (png) => {
+      const screenText = await readScreenText(png);
+      console.log(`[llm] ${llm.provider} is text-only; sending ${screenText.length} chars of OCR screen text`);
+      ({ system, userText: built } = ocr.withScreenText(system, built, screenText));
+    };
+    if (screenPng) await addScreenText(screenPng);
 
     // Watchdog: a provider that stalls mid-stream would otherwise hang the await forever,
     // leaving state.busy = true and wedging every later question until an app restart.
     let watchdog = null;
     let rearm = () => {};
+    let lastAlivePing = 0;
     const stalled = new Promise((_res, reject) => {
       rearm = () => {
         clearTimeout(watchdog);
@@ -849,17 +893,42 @@ async function runFeature(mode, userText) {
       };
       rearm();
     });
-    try {
-      await Promise.race([
-        llm.stream({
+    const streamWith = (model) => Promise.race([
+        model.stream({
           system,
           turns: [{ role: 'user', text: built }],
           imageDataUrl,
+          // Never answer a screen request blind: throw so OCR can take over.
+          requireImage: !!imageDataUrl,
           onToken: (t) => { if (streamSettled) return; rearm(); send('llm:token', { text: t }); },
-          onResponse: settings.provider === publik.PUBLIK_PROVIDER ? (res) => publikNoteHeaders(res && res.headers) : undefined
+          // Any stream event (e.g. a thinking model working before its first visible token) is liveness.
+          onActivity: () => {
+            if (streamSettled) return;
+            rearm();
+            // The renderer's own 40s failsafe only sees visible tokens; keep it alive (throttled).
+            const now = Date.now();
+            if (now - lastAlivePing > 5000) { lastAlivePing = now; send('llm:alive', {}); }
+          },
+          // The answer stopped at the output cap — say so rather than present it as complete.
+          onTruncated: () => { if (!streamSettled) send('llm:truncated', {}); },
+          onResponse: model.provider === publik.PUBLIK_PROVIDER ? (res) => publikNoteHeaders(res && res.headers) : undefined
         }),
         stalled
       ]);
+    try {
+      try {
+        await streamWith(llm);
+      } catch (e) {
+        // First time this model is seen rejecting images (it is now marked
+        // text-only): read the screen's text and ask the same model again.
+        if (!e || e.code !== 'IMAGE_UNSUPPORTED') throw e;
+        const png = await captureScreenshot({ fullResPng: true });
+        if (!png) throw new Error('No screen source was available.');
+        await addScreenText(png);
+        imageDataUrl = null;
+        rearm();
+        await streamWith(llm);
+      }
     } finally {
       streamSettled = true;
       clearTimeout(watchdog);

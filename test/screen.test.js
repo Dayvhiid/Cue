@@ -63,3 +63,37 @@ test('a small capture is never upscaled', () => {
   encodeScreenshot(fakeImage(1280, 800, log));
   assert.deepEqual(log, [{ toJPEG: JPEG_QUALITY }]);
 });
+
+// Regression: a capture that never settles used to hold runFeature's lock
+// forever, so every later Smart assist click was silently dropped.
+test('withTimeout rejects a capture that never settles', async () => {
+  const { withTimeout } = requireScreen();
+  const never = new Promise(() => {});
+  await assert.rejects(withTimeout(never, 20, 'Screen capture timed out.'), /Screen capture timed out/);
+});
+
+test('withTimeout passes through a capture that settles in time', async () => {
+  const { withTimeout } = requireScreen();
+  assert.equal(await withTimeout(Promise.resolve('data:ok'), 1000), 'data:ok');
+  await assert.rejects(withTimeout(Promise.reject(new Error('boom')), 1000), /boom/);
+});
+
+test('captureScreenshot is bounded by the capture timeout', async () => {
+  const { captureScreenshot } = requireScreen({
+    desktopCapturer: { getSources: () => new Promise(() => {}) },
+    screen: { getPrimaryDisplay: () => ({ id: 1, size: { width: 100, height: 100 }, scaleFactor: 1 }) }
+  });
+  if (process.platform === 'darwin') return; // mac path shells out to screencapture first
+  await assert.rejects(captureScreenshot({ timeoutMs: 20 }), /timed out/);
+});
+
+function requireScreen(electronStub = { desktopCapturer: {}, screen: {} }) {
+  const p = require.resolve('../src/screen');
+  delete require.cache[p];
+  const load = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (request === 'electron') return electronStub;
+    return load.call(this, request, parent, isMain);
+  };
+  try { return require('../src/screen'); } finally { Module._load = load; }
+}

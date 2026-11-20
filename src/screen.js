@@ -57,10 +57,36 @@ function captureMacNative() {
   });
 }
 
-async function captureScreenshot() {
+// A screenshot normally takes well under a second. Anything past this means the
+// capture backend is stuck (e.g. desktopCapturer.getSources never settling while
+// another capture — the slide poller, system-audio setup — is in flight). The
+// caller holds the feature lock while it waits, so an unbounded wait here wedges
+// every later Smart assist click until the app restarts.
+const CAPTURE_TIMEOUT_MS = 8000;
+
+/** Reject if `promise` has not settled within `ms`. The timer never outlives the race. */
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const timeout = new Promise((_res, reject) => {
+    timer = setTimeout(() => reject(new Error(message || `timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Resolves to a JPEG data URL sized for vision models, or with `fullResPng`
+ * to a full-resolution PNG Buffer (for local OCR, where small text needs
+ * every pixel and nothing is uploaded). null when no screen source exists.
+ */
+function captureScreenshot({ timeoutMs = CAPTURE_TIMEOUT_MS, fullResPng = false } = {}) {
+  const encode = fullResPng ? (img) => img.toPNG() : encodeScreenshot;
+  return withTimeout(captureScreenshotUnbounded(encode), timeoutMs, 'Screen capture timed out.');
+}
+
+async function captureScreenshotUnbounded(encode) {
   if (process.platform === 'darwin') {
     const macImg = await captureMacNative();
-    if (macImg) return encodeScreenshot(macImg);
+    if (macImg) return encode(macImg);
   }
 
   const primary = screen.getPrimaryDisplay();
@@ -75,7 +101,7 @@ async function captureScreenshot() {
   const src = sources.find((s) => String(s.display_id) === String(primary.id)) || sources[0];
   const img = src.thumbnail;
   if (!img || img.isEmpty()) return null;
-  return encodeScreenshot(img); // data:image/jpeg;base64,...
+  return encode(img);
 }
 
-module.exports = { captureScreenshot, encodeScreenshot, captureMacNative, MAX_LONG_EDGE_PX, JPEG_QUALITY, MAX_DATA_URL_BYTES };
+module.exports = { captureScreenshot, encodeScreenshot, captureMacNative, withTimeout, CAPTURE_TIMEOUT_MS, MAX_LONG_EDGE_PX, JPEG_QUALITY, MAX_DATA_URL_BYTES };
